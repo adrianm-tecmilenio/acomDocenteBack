@@ -18,24 +18,12 @@ from langgraph.graph import StateGraph
 from pinecone import Pinecone
 import snowflake.connector
 
-from .prompts import PYDANTIC_SYSTEM_PROMPT
-
-
+from .prompts import PYDANTIC_SYSTEM_PROMPT, REFINE_QUERY_PROMPT
 
 # Cargar credenciales desde .env
 load_dotenv()
 
 router = APIRouter()
-
-# Snowflake connection configuration
-SNOWFLAKE_CONFIG = {
-    "user": os.getenv("SNOWFLAKE_USER"),
-    "password": os.getenv("SNOWFLAKE_PASSWORD"),
-    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
-    "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
-    "database": os.getenv("SNOWFLAKE_DATABASE"),
-    "schema": os.getenv("SNOWFLAKE_SCHEMA"),
-}
 
 class Item(BaseModel):
     message: str
@@ -121,35 +109,6 @@ def get_chat_history_from_snowflake(session_id: str, limit: int = 10):
         if conn is not None:
             conn.close()
 
-# @router.post('/agent')
-# async def agent(body:Item):
-#     try:
-#         llm = AzureChatOpenAI(
-#             deployment_name="gpt4oIA-AM",
-#             model_name="gpt-4o",
-#             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-#         )
-
-#         messages = [
-#             SystemMessage(content="""
-#                           You are an expert chef, 
-#                           and you are teaching a cooking class.
-#                           Give the user a cooking instruction.""")
-#         ]
-
-#         messages.append(
-#             HumanMessage(
-#                 content=body.message
-#             )
-#         )
-
-#         res = llm.invoke(messages)
-   
-#         return {'message': res.content}
-#     except Exception as e:
-#         raise e
-#         # return {'message': str(e)}
-
 client = AsyncAzureOpenAI(
             azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
             api_version='2024-05-01-preview',
@@ -181,7 +140,7 @@ def upsert_in_batches(index, vectors, batch_size=100):
 
 async def load_pdfs_and_store_embeddings(pdf_files):
     """Carga PDFs, extrae texto y almacena embeddings en FAISS."""
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=300)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2200, chunk_overlap=300)
 
     for file in pdf_files:
         # Read the PDF file in memory
@@ -269,7 +228,7 @@ async def retrieve_context(state: ChatState):
     query_embedding = embeddings.embed_query(state.query)
 
     # Query Pinecone index
-    results = index.query(vector=query_embedding, top_k=20, include_metadata=True)
+    results = index.query(vector=query_embedding, top_k=10, include_metadata=True)
 
     context = "\n".join([match.metadata["text"] for match in results.matches])
 
@@ -314,6 +273,27 @@ def format_chat_history_for_pydantic(chat_history):
             )
     return formatted_history
 
+# Función para el agente intermedio
+async def refine_query(state: ChatState):
+    """Transforma la consulta del usuario en una consulta más detallada y específica."""
+    system_prompt = REFINE_QUERY_PROMPT
+    
+    user_query = state.query
+    prompt = f"Consulta original del usuario: {user_query}\n\nTransforma esta consulta en una pregunta más detallada y específica:"
+
+    model = OpenAIModel('gpt-4o', openai_client=client)
+    agent = Agent(model, system_prompt=system_prompt)
+
+    response = await agent.run(prompt)
+
+    print("REFINED QUERY", response.data)
+
+    # Actualiza la consulta en el estado
+    state.query = response.data
+
+    return state
+
+
 # Función que ejecuta Pydantic AI con el contexto recuperado
 async def call_pydantic_ai(state: ChatState):
     """Ejecuta Pydantic AI con el contexto obtenido."""
@@ -340,11 +320,13 @@ async def call_pydantic_ai(state: ChatState):
 # Construir grafo de LangGraph
 graph = StateGraph(ChatState)
 
+graph.add_node("refine_query", refine_query)
 graph.add_node("retrieve_context", retrieve_context)
 graph.add_node("call_pydantic_ai", call_pydantic_ai)
 
 # Conectar los nodos en orden
-graph.set_entry_point("retrieve_context")
+graph.set_entry_point("refine_query")
+graph.add_edge("refine_query", "retrieve_context")
 graph.add_edge("retrieve_context", "call_pydantic_ai")
 graph.set_finish_point("call_pydantic_ai")
 
@@ -372,7 +354,7 @@ async def pydantic_agent(body: Item):
         # Stream the state updates
         final_state = None
         async for output in executor.astream(initial_state):
-            final_state = output  # Capture the final state
+            final_state = output
 
         # Return the final response
         if final_state:
